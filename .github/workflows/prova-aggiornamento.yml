@@ -24,7 +24,7 @@ jobs:
           $exe = Join-Path $dir "Anonimizza-DICOM-Windows.exe"
           # app senza console: Start-Process -Wait per avere il codice di uscita
           $p = Start-Process -FilePath $exe -ArgumentList "--aggiorna" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "--aggiorna da $old a $new: codice $($p.ExitCode)" }
+          if ($p.ExitCode -ne 0) { throw "--aggiorna da $old a ${new}: codice $($p.ExitCode)" }
           gh release download $new --pattern "SHA256SUMS.txt" --dir $dir
           $line = Get-Content (Join-Path $dir "SHA256SUMS.txt") | Where-Object { $_ -match "Anonimizza-DICOM-Windows\.exe$" }
           $expected = ($line -split "\s+")[0].ToLower()
