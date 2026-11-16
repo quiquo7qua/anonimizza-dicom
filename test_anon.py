@@ -1,12 +1,16 @@
 """Test di scanner, anonimizzatore e parser del masterizzatore. Avvio: python test_anon.py"""
+import hashlib
+import io
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pydicom
 from pydicom.data import get_testdata_file
@@ -1704,6 +1708,825 @@ def test_selftest_checks_pywin32_bundle(tmp: Path):
         sys.platform = saved[0]
         for n, module in saved[1].items():
             _restore_module(n, module)
+
+
+# ---------- aggiornamenti automatici (rete finta: nessun test tocca internet) ----------
+
+
+class _FakeResp:
+    """Risposta finta di urlopen: read(), geturl() e context manager."""
+
+    def __init__(self, data: bytes = b"", url: str = ""):
+        self._data, self._url = io.BytesIO(data), url
+
+    def read(self, n=-1):
+        return self._data.read(n)
+
+    def geturl(self):
+        return self._url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _release_opener(version: str, files: dict, sums: dict | None = None):
+    """Opener finto di una release: serve i file e SHA256SUMS.txt (calcolato, o `sums` per falsarlo)."""
+    import urllib.error
+
+    import updater
+
+    listed = sums if sums is not None else {n: hashlib.sha256(d).hexdigest() for n, d in files.items()}
+    served = dict(files)
+    served["SHA256SUMS.txt"] = "".join(f"{h}  {n}\n" for n, h in listed.items()).encode()
+    base = f"https://github.com/{updater.REPO}/releases/download/v{version}/"
+    asked = []
+
+    def opener(url, timeout=None):
+        asked.append(url)
+        if not url.startswith(base) or url[len(base):] not in served:
+            raise urllib.error.URLError("non trovato")
+        return _FakeResp(served[url[len(base):]], url)
+
+    opener.asked = asked
+    return opener
+
+
+def test_updater_versions():
+    import updater
+
+    assert updater.parse_version("1.2.0") == (1, 2, 0)
+    assert updater.parse_version("10.0.1") == (10, 0, 1)
+    for bad in ("dev", "", "1.2.x", "v1.2.0", "1..2", None):
+        assert updater.parse_version(bad) is None, bad
+    assert updater.is_newer("1.2.0", "1.1.9")
+    assert updater.is_newer("1.10.0", "1.9.0")  # confronto numerico, non di testo
+    assert updater.is_newer("2.0.0", "1.99.99")
+    assert not updater.is_newer("1.2.0", "1.2.0")
+    assert not updater.is_newer("1.1.0", "1.2.0")
+    assert not updater.is_newer("1.2.0", "dev") and not updater.is_newer("boh", "1.0.0")
+
+
+def test_updater_latest_version():
+    import urllib.error
+
+    import updater
+
+    def final(url):
+        return lambda u, timeout=None: _FakeResp(url=url)
+
+    base = f"https://github.com/{updater.REPO}/releases/tag/v"
+    assert updater.latest_version(final(base + "1.2.0")) == "1.2.0"
+    assert updater.latest_version(final(f"https://github.com/{updater.REPO}/releases")) is None  # nessuna release
+    assert updater.latest_version(final(base + "beta")) is None
+    seen = {}
+    updater.latest_version(lambda u, timeout=None: seen.update(url=u, timeout=timeout) or _FakeResp(url=base + "1.0.0"))
+    assert seen == {"url": f"https://github.com/{updater.REPO}/releases/latest", "timeout": 5}, seen
+
+    def boom(exc):
+        def opener(u, timeout=None):
+            raise exc
+
+        return opener
+
+    for exc in (urllib.error.URLError("rete"), TimeoutError(), OSError("proxy"), ValueError("x")):
+        assert updater.latest_version(boom(exc)) is None, exc
+
+
+def test_updater_download_verified(tmp: Path):
+    import updater
+
+    data = b"contenuto dell'app" * 1000
+    with mock.patch.object(sys, "platform", "win32"):
+        name = updater.ASSETS["win32"]
+        dest = tmp / "nuovo.bin"
+        opener = _release_opener("1.2.0", {name: data})
+        assert updater.download_verified("1.2.0", dest, opener) == dest
+        assert dest.read_bytes() == data
+        assert opener.asked[0].endswith("/v1.2.0/SHA256SUMS.txt") and opener.asked[1].endswith("/v1.2.0/" + name)
+        # impronta sbagliata: file cancellato
+        bad = tmp / "cattivo.bin"
+        opener = _release_opener("1.2.0", {name: data}, sums={name: "0" * 64})
+        try:
+            updater.download_verified("1.2.0", bad, opener)
+            assert False, "doveva rifiutare l'impronta sbagliata"
+        except updater.UpdateError as exc:
+            assert "impronta" in str(exc)
+        assert not bad.exists()
+        # asset non elencato in SHA256SUMS.txt
+        missing = tmp / "manca.bin"
+        opener = _release_opener("1.2.0", {name: data}, sums={"altro.zip": "a" * 64})
+        try:
+            updater.download_verified("1.2.0", missing, opener)
+            assert False, "doveva rifiutare l'asset non elencato"
+        except updater.UpdateError:
+            pass
+        assert not missing.exists()
+        # rete assente (asset o impronte): errore e nessun file
+        gone = tmp / "rete.bin"
+        try:
+            updater.download_verified("9.9.9", gone, _release_opener("1.2.0", {name: data}))
+            assert False
+        except OSError:  # URLError è un OSError
+            pass
+        assert not gone.exists()
+    with mock.patch.object(sys, "platform", "linux"):
+        try:
+            updater.download_verified("1.2.0", tmp / "x", _release_opener("1.2.0", {}))
+            assert False
+        except updater.UpdateError as exc:
+            assert "non supportato" in str(exc)
+
+
+def _fail_move_in(app: Path):
+    """os.replace che nega sempre di mettere al suo posto la versione nuova; il ripristino della vecchia riesce."""
+    real = os.replace
+
+    def replace(src, dst):
+        if Path(dst) == app and not Path(src).name.endswith((".old", ".vecchia")):
+            raise PermissionError("bloccato")
+        return real(src, dst)
+
+    return replace
+
+
+def test_updater_install_windows(tmp: Path):
+    import updater
+
+    exe = tmp / "Anonimizza DICOM.exe"
+    exe.write_bytes(b"vecchio")
+    new = b"nuovo" * 500
+    opener = _release_opener("1.2.0", {updater.ASSETS["win32"]: new})
+    with mock.patch.object(sys, "platform", "win32"):
+        assert updater.install("1.2.0", opener, path=exe) == exe
+        assert exe.read_bytes() == new
+        assert (tmp / "Anonimizza DICOM.exe.old").read_bytes() == b"vecchio"
+        assert sorted(p.name for p in tmp.iterdir()) == ["Anonimizza DICOM.exe", "Anonimizza DICOM.exe.old"]  # nessun .new
+        # un .old rimasto da un aggiornamento precedente non blocca il successivo
+        assert updater.install("1.2.0", opener, path=exe) == exe
+        assert (tmp / "Anonimizza DICOM.exe.old").read_bytes() == new
+
+    # seconda rinomina fallita: si ripristina l'originale e non resta nulla
+    exe2 = tmp / "b" / "App.exe"
+    exe2.parent.mkdir()
+    exe2.write_bytes(b"originale")
+    with mock.patch.object(sys, "platform", "win32"), mock.patch.object(updater.os, "replace", _fail_move_in(exe2)), \
+            mock.patch.object(updater.time, "sleep", lambda s: None):
+        try:
+            updater.install("1.2.0", opener, path=exe2)
+            assert False
+        except PermissionError:
+            pass
+    assert exe2.read_bytes() == b"originale"
+    assert sorted(p.name for p in exe2.parent.iterdir()) == ["App.exe"]
+
+    # impronta sbagliata: l'exe non si tocca
+    exe3 = tmp / "c" / "App.exe"
+    exe3.parent.mkdir()
+    exe3.write_bytes(b"originale")
+    bad = _release_opener("1.2.0", {updater.ASSETS["win32"]: new}, sums={updater.ASSETS["win32"]: "0" * 64})
+    with mock.patch.object(sys, "platform", "win32"):
+        try:
+            updater.install("1.2.0", bad, path=exe3)
+            assert False
+        except updater.UpdateError:
+            pass
+    assert exe3.read_bytes() == b"originale" and [p.name for p in exe3.parent.iterdir()] == ["App.exe"]
+
+
+def _bundle(folder: Path, content: bytes) -> Path:
+    exe = folder / "Anonimizza DICOM.app" / "Contents" / "MacOS" / "Anonimizza DICOM"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(content)
+    return folder / "Anonimizza DICOM.app"
+
+
+def _fake_ditto(calls):
+    """subprocess.run finto: `ditto -x -k <zip> <cartella>` con zipfile."""
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        assert cmd[:3] == ["ditto", "-x", "-k"] and kw.get("check"), (cmd, kw)
+        with zipfile.ZipFile(cmd[3]) as z:
+            z.extractall(cmd[4])
+
+    return run
+
+
+def _zip_of(app_bytes: bytes) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("Anonimizza DICOM.app/Contents/MacOS/Anonimizza DICOM", app_bytes)
+        z.writestr("Anonimizza DICOM.app/Contents/Info.plist", b"plist")
+    return buf.getvalue()
+
+
+def test_updater_install_mac(tmp: Path):
+    import updater
+
+    apps = tmp / "Applications"
+    apps.mkdir()
+    app = _bundle(apps, b"vecchia")
+    asset = updater.ASSETS["darwin"]
+    opener = _release_opener("1.2.0", {asset: _zip_of(b"nuova")})
+    calls, moves, real_replace = [], [], os.replace
+    with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(updater.subprocess, "run", _fake_ditto(calls)), \
+            mock.patch.object(updater.os, "replace", lambda s, d: moves.append((Path(s), Path(d))) or real_replace(s, d)):
+        assert updater.install("1.2.0", opener, path=app) == app
+    assert len(calls) == 1
+    # il backup resta nella cartella dell'app (stesso genitore, nascosto): spostarlo altrove richiederebbe permessi sul bundle
+    assert moves[0][0] == app and moves[0][1].parent == apps and moves[0][1].name.startswith("."), moves
+    assert (app / "Contents" / "MacOS" / "Anonimizza DICOM").read_bytes() == b"nuova"
+    assert [p.name for p in apps.iterdir()] == ["Anonimizza DICOM.app"]  # nessun temporaneo né backup
+
+    # seconda mossa fallita: si ripristina il bundle vecchio e si pulisce
+    app2 = _bundle(tmp, b"originale")
+    with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(updater.subprocess, "run", _fake_ditto([])), \
+            mock.patch.object(updater.os, "replace", _fail_move_in(app2)), \
+            mock.patch.object(updater.time, "sleep", lambda s: None):
+        try:
+            updater.install("1.2.0", opener, path=app2)
+            assert False
+        except PermissionError:
+            pass
+    assert (app2 / "Contents" / "MacOS" / "Anonimizza DICOM").read_bytes() == b"originale"
+    assert sorted(p.name for p in tmp.iterdir() if p.name.startswith(".") or p.suffix == ".app") == ["Anonimizza DICOM.app"]
+
+    # impronta sbagliata: bundle intatto, niente avanzi, ditto mai chiamato
+    (tmp / "z").mkdir()
+    app3 = _bundle(tmp / "z", b"intatta")
+    bad = _release_opener("1.2.0", {asset: _zip_of(b"nuova")}, sums={asset: "0" * 64})
+    calls = []
+    with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(updater.subprocess, "run", _fake_ditto(calls)):
+        try:
+            updater.install("1.2.0", bad, path=app3)
+            assert False
+        except updater.UpdateError:
+            pass
+    assert not calls and [p.name for p in app3.parent.iterdir()] == ["Anonimizza DICOM.app"]
+    assert (app3 / "Contents" / "MacOS" / "Anonimizza DICOM").read_bytes() == b"intatta"
+
+    # zip senza .app dentro: errore e bundle intatto
+    (tmp / "w").mkdir()
+    app4 = _bundle(tmp / "w", b"intatta")
+    empty = io.BytesIO()
+    with zipfile.ZipFile(empty, "w") as z:
+        z.writestr("leggimi.txt", "niente")
+    with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(updater.subprocess, "run", _fake_ditto([])):
+        try:
+            updater.install("1.2.0", _release_opener("1.2.0", {asset: empty.getvalue()}), path=app4)
+            assert False
+        except updater.UpdateError:
+            pass
+    assert [p.name for p in app4.parent.iterdir()] == ["Anonimizza DICOM.app"]
+
+
+def test_updater_mac_double_failure_keeps_backup(tmp: Path):
+    import updater
+
+    app = _bundle(tmp, b"originale")
+    asset = updater.ASSETS["darwin"]
+    real_replace, count = os.replace, []
+
+    def replace(src, dst):  # la prima mossa (app → backup) riesce, poi tutto fallisce, anche il ripristino
+        count.append(1)
+        if len(count) == 1:
+            return real_replace(src, dst)
+        raise PermissionError("bloccato")
+
+    with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(updater.subprocess, "run", _fake_ditto([])), \
+            mock.patch.object(updater.os, "replace", replace), mock.patch.object(updater.time, "sleep", lambda s: None):
+        try:
+            updater.install("1.2.0", _release_opener("1.2.0", {asset: _zip_of(b"nuova")}), path=app)
+            assert False
+        except PermissionError:
+            pass
+    backup = tmp / f".{app.name}.vecchia"
+    assert not app.exists() and (backup / "Contents" / "MacOS" / "Anonimizza DICOM").read_bytes() == b"originale"
+
+
+def test_updater_target_and_relaunch(tmp: Path):
+    import updater
+
+    with mock.patch.object(sys, "platform", "win32"), mock.patch.object(sys, "executable", str(tmp / "App.exe")):
+        assert updater.target() == tmp / "App.exe"
+    exe = str(tmp / "Applications" / "Anonimizza DICOM.app" / "Contents" / "MacOS" / "Anonimizza DICOM")
+    with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(sys, "executable", exe):
+        assert updater.target() == tmp / "Applications" / "Anonimizza DICOM.app"
+    with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(sys, "executable", "/usr/bin/python3"):
+        try:
+            updater.target()
+            assert False
+        except updater.UpdateError:
+            pass
+
+    launched = []
+    with mock.patch.object(updater.subprocess, "Popen", lambda cmd, **kw: launched.append((cmd, kw))):
+        with mock.patch.object(sys, "platform", "win32"):
+            updater.relaunch(tmp / "App.exe")
+        with mock.patch.object(sys, "platform", "darwin"):
+            updater.relaunch(tmp / "App.app")
+    assert launched[0][0] == [str(tmp / "App.exe")]
+    assert launched[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"  # il nuovo onefile non riusa le cartelle del vecchio
+    assert launched[1][0] == ["open", "-n", str(tmp / "App.app")]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_updater_opener_and_tls():
+    import ssl
+
+    import updater
+
+    seen = {}
+
+    def fake_urlopen(req, timeout=None, context=None):
+        seen.update(req=req, timeout=timeout, context=context)
+        return _FakeResp(url="https://github.com/")
+
+    contexts = []
+    real_ctx = lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # il vero create_default_context legge lo store di Windows se sys.platform è finto
+    with mock.patch.object(updater, "VERSION", "1.2.0"), mock.patch.object(updater.urllib.request, "urlopen", fake_urlopen), \
+            mock.patch.object(updater.ssl, "create_default_context", lambda **kw: contexts.append(kw) or real_ctx()):
+        for platform in ("darwin", "win32"):
+            contexts.clear()
+            with mock.patch.object(sys, "platform", platform):
+                updater.open_url("https://github.com/x", timeout=7)
+            assert seen["req"].get_header("User-agent") == "Anonimizza-DICOM/1.2.0" and seen["timeout"] == 7
+            assert seen["context"] is not None
+            # su Mac il pacchetto di CA di sistema (il Portachiavi non è letto da OpenSSL); su Windows il contesto predefinito
+            assert contexts == ([{"cafile": updater.CAFILE}] if platform == "darwin" else [{}]), contexts
+    # il file delle CA manca: errore di rete normale (OSError), non un'eccezione strana, e nessuna richiesta
+    seen.clear()
+    with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(updater, "CAFILE", "/non/esiste/cert.pem"), \
+            mock.patch.object(updater.urllib.request, "urlopen", fake_urlopen):
+        try:
+            updater.open_url("https://github.com/x")
+            assert False
+        except OSError:
+            pass
+        assert not seen
+        assert updater.latest_version() is None
+    if sys.platform == "darwin":  # il pacchetto vero di macOS contiene delle CA
+        assert updater.context().cert_store_stats()["x509_ca"] > 0
+
+
+def test_selftest_checks_mac_ca_bundle(tmp: Path):
+    import app as gui
+    import updater
+
+    src = make_source(tmp / "src")
+    with mock.patch.object(sys, "platform", "darwin"):
+        with mock.patch.object(updater, "context", lambda: SimpleNamespace(cert_store_stats=lambda: {"x509_ca": 0})):
+            assert gui.selftest(src) == 1
+        with mock.patch.object(updater, "CAFILE", "/non/esiste/cert.pem"):
+            assert gui.selftest(src) == 1
+        with mock.patch.object(updater, "context", lambda: SimpleNamespace(cert_store_stats=lambda: {"x509_ca": 5})):
+            assert gui.selftest(src) == 0
+
+
+def test_updater_can_replace(tmp: Path):
+    import updater
+
+    folder = tmp / "Applications"
+    folder.mkdir()
+    app = _bundle(folder, b"x")
+    with mock.patch.object(sys, "platform", "darwin"):
+        assert updater.can_replace(app) is None
+        reason = updater.can_replace(Path("/private/var/folders/ab/T/AppTranslocation/1234/d/Anonimizza DICOM.app"))
+        assert reason and "Applicazioni" in reason and "AppTranslocation" not in reason, reason  # niente percorsi
+        # anche con separatori di Windows il percorso si legge a pezzi
+        assert updater.can_replace(Path("C:/a/AppTranslocation/b/X.app")) is not None
+    with mock.patch.object(sys, "platform", "win32"):
+        assert updater.can_replace(tmp / "App.exe") is None
+    if os.name == "posix" and os.geteuid() != 0:
+        folder.chmod(0o555)
+        try:
+            with mock.patch.object(sys, "platform", "darwin"):
+                reason = updater.can_replace(app)
+            assert reason and "scrivibile" in reason and str(folder) not in reason, reason
+        finally:
+            folder.chmod(0o755)
+        app.chmod(0o555)  # bundle di un altro amministratore: la cartella è scrivibile ma il bundle no
+        try:
+            with mock.patch.object(sys, "platform", "darwin"):
+                reason = updater.can_replace(app)
+            assert reason and "scrivibile" in reason, reason
+        finally:
+            app.chmod(0o755)
+    gone = updater.can_replace(tmp / "non-esiste" / "App.exe")
+    assert gone and "scrivibile" in gone
+
+
+def test_updater_cleanup_old(tmp: Path):
+    import updater
+
+    exe = tmp / "App.exe"
+    exe.write_bytes(b"x")
+    old, new = tmp / "App.exe.old", tmp / "AppXY12.new"
+    new_mine = tmp / "App.exeab12.new"
+    for f in (old, new, new_mine):
+        f.write_bytes(b"y")
+    with mock.patch.object(sys, "platform", "win32"), mock.patch.object(sys, "executable", str(exe)), \
+            mock.patch.object(updater, "enabled", lambda: False):
+        updater.cleanup_old()  # non attivo: non tocca nulla
+        assert old.exists() and new_mine.exists()
+    with mock.patch.object(sys, "platform", "win32"), mock.patch.object(sys, "executable", str(exe)), \
+            mock.patch.object(updater, "enabled", lambda: True):
+        updater.cleanup_old()
+        assert sorted(p.name for p in tmp.iterdir()) == ["App.exe", "AppXY12.new"]  # solo i resti di questa app
+        updater.cleanup_old()  # niente da togliere: nessun errore
+        with mock.patch.object(updater.Path, "unlink", side_effect=PermissionError("in uso")):
+            old.write_bytes(b"y")
+            updater.cleanup_old()  # .old ancora in uso: si ignora
+        assert old.exists()
+    folder = tmp / "Applicazioni"
+    folder.mkdir()
+    app = _bundle(folder, b"x")
+    junk = [folder / ".aggiornamento_ab12", folder / ".Anonimizza DICOM.app.vecchia"]
+    for j in junk:
+        (j / "dentro").mkdir(parents=True)
+    other = folder / ".altro"
+    other.mkdir()
+    with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(sys, "executable", str(app / "Contents" / "MacOS" / "x")), \
+            mock.patch.object(updater, "enabled", lambda: True):
+        updater.cleanup_old()
+    assert sorted(p.name for p in folder.iterdir()) == [".altro", "Anonimizza DICOM.app"]
+
+
+def test_updater_enabled(tmp: Path):
+    import updater
+
+    exe = tmp / "App.exe"
+    with mock.patch.object(updater, "VERSION", "1.2.0"), mock.patch.object(sys, "platform", "win32"), \
+            mock.patch.object(sys, "executable", str(exe)), mock.patch.dict(os.environ, clear=False):
+        os.environ.pop("ANONIMIZZA_NO_AGGIORNAMENTI", None)
+        assert not updater.enabled()  # non compilata
+        with mock.patch.object(sys, "frozen", True, create=True):
+            assert updater.enabled()
+            with mock.patch.object(updater, "VERSION", "dev"):
+                assert not updater.enabled()
+            os.environ["ANONIMIZZA_NO_AGGIORNAMENTI"] = "1"  # interruttore dell'IT
+            assert not updater.enabled()
+            del os.environ["ANONIMIZZA_NO_AGGIORNAMENTI"]
+            (tmp / "no-aggiornamenti").write_text("")  # file accanto all'app
+            assert not updater.enabled()
+        (tmp / "no-aggiornamenti").unlink()
+    # Mac: il file sta accanto al bundle, non dentro
+    (tmp / "Apps").mkdir()
+    app = _bundle(tmp / "Apps", b"x")
+    with mock.patch.object(updater, "VERSION", "1.2.0"), mock.patch.object(sys, "platform", "darwin"), \
+            mock.patch.object(sys, "executable", str(app / "Contents" / "MacOS" / "x")), mock.patch.object(sys, "frozen", True, create=True):
+        assert updater.enabled()
+        (tmp / "Apps" / "no-aggiornamenti").write_text("")
+        assert not updater.enabled()
+    with mock.patch.object(updater, "VERSION", "1.2.0"), mock.patch.object(sys, "platform", "darwin"), \
+            mock.patch.object(sys, "executable", "/usr/bin/python3"), mock.patch.object(sys, "frozen", True, create=True):
+        assert not updater.enabled()  # bundle non trovato: meglio non fare nulla
+    import version
+
+    assert version.VERSION == "dev"  # nel repository non si aggiorna mai
+
+
+def test_updater_retries_locked_replace(tmp: Path):
+    import updater
+
+    exe = tmp / "App.exe"
+    exe.write_bytes(b"originale")
+    opener = _release_opener("1.2.0", {updater.ASSETS["win32"]: b"nuovo"})
+    real, fails, slept = os.replace, [3], []
+
+    def flaky(src, dst):  # antivirus o indicizzazione: i primi tentativi vengono negati
+        if fails[0]:
+            fails[0] -= 1
+            raise PermissionError("in uso")
+        return real(src, dst)
+
+    with mock.patch.object(sys, "platform", "win32"), mock.patch.object(updater.os, "replace", flaky), \
+            mock.patch.object(updater.time, "sleep", slept.append):
+        updater.install("1.2.0", opener, path=exe)
+    assert exe.read_bytes() == b"nuovo" and slept == [updater.RETRY_DELAY] * 3, slept
+    assert updater.RETRY_DELAY == 0.5 and updater.RETRIES == 10
+
+
+def test_updater_windows_second_instance(tmp: Path):
+    import updater
+
+    exe = tmp / "App.exe"
+    exe.write_bytes(b"originale")
+    (tmp / "App.exe.old").write_bytes(b"in uso")
+    opener = _release_opener("1.2.0", {updater.ASSETS["win32"]: b"nuovo"})
+    real_unlink = updater.Path.unlink
+
+    def unlink(self, *a, **kw):
+        if self.name.endswith(".old"):
+            raise PermissionError("in uso")
+        return real_unlink(self, *a, **kw)
+
+    with mock.patch.object(sys, "platform", "win32"), mock.patch.object(updater.Path, "unlink", unlink):
+        try:
+            updater.install("1.2.0", opener, path=exe)
+            assert False
+        except updater.UpdateError as exc:
+            assert str(exc) == "Chiudi le altre finestre di Anonimizza DICOM e riprova."
+    assert exe.read_bytes() == b"originale" and not opener.asked  # nemmeno scaricato
+    assert sorted(p.name for p in tmp.iterdir()) == ["App.exe", "App.exe.old"]
+
+
+def test_updater_explain():
+    import errno
+
+    import updater
+
+    assert updater.explain(updater.UpdateError("Chiudi le altre finestre.")) == "Chiudi le altre finestre."
+    assert "Disco pieno" in updater.explain(OSError(errno.ENOSPC, "x", "/a/b"))
+    for exc in (subprocess.CalledProcessError(1, ["ditto", "/a/b"]), PermissionError("/a/b"), ValueError("English text"), OSError(0, "x")):
+        text = updater.explain(exc)
+        assert text == "Aggiornamento non riuscito: l'app è rimasta com'era. Riprova più tardi o scarica la nuova versione a mano.", text
+
+
+def test_updater_url_checks():
+    import updater
+
+    assert updater.parse_version("١.٢.٣") is None  # cifre non ASCII
+    base = "/releases/tag/v1.2.0"
+    for url in ("https://evil.example.com" + base, "http://github.com" + base, "https://github.com.evil.example" + base):
+        assert updater.latest_version(lambda u, timeout=None, url=url: _FakeResp(url=url)) is None, url
+    assert updater.latest_version(lambda u, timeout=None: _FakeResp(url="https://github.com/" + updater.REPO + base)) == "1.2.0"
+
+
+def _ask_log(gui, answer):
+    asked = []
+    gui.messagebox.askyesno = lambda title, text, **kw: asked.append((title, text)) or answer
+    return asked
+
+
+def test_app_offer_update_skipped_when_busy_exam_or_dialog(tmp: Path):
+    window, messages = _window(tmp)
+    if not window:
+        return
+    import app as gui
+
+    asked = _ask_log(gui, False)
+    window._offer_update("9.9.9")  # esame caricato
+    window._clear_exam()
+    window.busy = True
+    window._offer_update("9.9.9")  # app occupata
+    window.busy = False
+    # finestra di scelta cartella aperta: la domanda non deve comparire sopra
+    gui.filedialog.askdirectory = lambda **kw: window._offer_update("9.9.9") or ""
+    window.on_choose_folder()
+    assert not window.dialog_open
+    gui.filedialog.askdirectory = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        window.on_choose_folder()
+    except RuntimeError:
+        pass
+    assert not window.dialog_open  # anche se la finestra fallisce
+    assert asked == [] and messages == [], (asked, messages)
+    with mock.patch.object(gui.updater, "target", lambda: Path("/x/App.exe")), mock.patch.object(gui.updater, "can_replace", lambda p: None):
+        window._offer_update("9.9.9")  # ferma e vuota: la domanda compare
+    assert len(asked) == 1
+    _close(window)
+
+
+def test_app_call_event_leaves_busy_untouched(tmp: Path):
+    window, messages = _new_window()
+    if not window:
+        return
+    seen = []
+    window.busy = True
+    window.events.put(("call", lambda v: seen.append((v, window.busy)), "x"))
+    window.update()
+    import time
+
+    end = time.time() + 5
+    while not seen and time.time() < end:
+        window.update()
+        time.sleep(0.02)
+    assert seen == [("x", True)] and window.busy
+    window.busy = False
+    _close(window)
+
+
+def test_app_offer_update_declined_does_nothing(tmp: Path):
+    window, messages = _new_window()
+    if not window:
+        return
+    import app as gui
+
+    with mock.patch.object(gui.updater, "VERSION", "1.0.0"), mock.patch.object(gui.updater, "install") as install, \
+            mock.patch.object(gui.updater, "target", lambda: Path("/x/App.exe")), mock.patch.object(gui.updater, "can_replace", lambda p: None):
+        asked = _ask_log(gui, False)
+        window._offer_update("1.2.0")
+        assert asked == [("Aggiornamento", "È disponibile la versione 1.2.0 (attuale 1.0.0). Aggiornare ora? "
+                          "Ci vogliono circa 20 secondi. L'app si chiuderà e si riaprirà.")], asked
+        install.assert_not_called()
+    _close(window)
+
+
+def test_app_offer_update_cannot_replace_asks_to_open_page(tmp: Path):
+    window, messages = _new_window()
+    if not window:
+        return
+    import app as gui
+
+    opened = []
+    with mock.patch.object(gui.updater, "target", lambda: Path("/x/App.exe")), \
+            mock.patch.object(gui.updater, "can_replace", lambda p: "la cartella dell'app non è scrivibile"), \
+            mock.patch.object(gui.updater, "install") as install, \
+            mock.patch.object(gui.webbrowser, "open", lambda url: opened.append(url)):
+        asked = _ask_log(gui, False)
+        window._offer_update("1.2.0")
+        assert opened == [] and len(asked) == 1  # No: niente browser
+        assert asked[0][1] == ("È disponibile la versione 1.2.0, ma questa copia non può aggiornarsi da sola "
+                               "(la cartella dell'app non è scrivibile). Aprire la pagina di download?"), asked
+        _ask_log(gui, True)
+        window._offer_update("1.2.0")
+        _pump(window)
+        install.assert_not_called()
+    assert opened == [f"https://github.com/{gui.updater.REPO}/releases/latest"], opened
+    assert messages == [], messages
+    _close(window)
+
+
+def test_app_offer_update_installs_in_background_then_relaunches(tmp: Path):
+    import threading
+
+    window, messages = _new_window()
+    if not window:
+        return
+    import app as gui
+
+    log, main = [], threading.current_thread()
+    destroyed = []
+    real_destroy = window.destroy
+    window.destroy = lambda: destroyed.append(1)
+    with mock.patch.object(gui.updater, "target", lambda: Path("/x/App.exe")), \
+            mock.patch.object(gui.updater, "can_replace", lambda p: None), \
+            mock.patch.object(gui.updater, "install", lambda v: log.append(("install", v, threading.current_thread() is main)) or Path("/x/App.exe")), \
+            mock.patch.object(gui.updater, "relaunch", lambda p: log.append(("relaunch", p, bool(destroyed)))):
+        _ask_log(gui, True)
+        window._offer_update("1.2.0")
+        _pump(window)
+    assert log == [("install", "1.2.0", False), ("relaunch", Path("/x/App.exe"), False)], log
+    assert destroyed == [1] and messages == [], (destroyed, messages)
+    window.destroy = real_destroy
+    _close(window)
+
+
+def test_app_offer_update_install_error_shown_without_exit(tmp: Path):
+    window, messages = _new_window()
+    if not window:
+        return
+    import app as gui
+
+    generic = "Aggiornamento non riuscito: l'app è rimasta com'era. Riprova più tardi o scarica la nuova versione a mano."
+    for error, shown, pages in (
+        (subprocess.CalledProcessError(1, ["ditto", "/a/b"]), generic, 1),  # niente testo grezzo, e pagina di download
+        (gui.updater.UpdateError("Chiudi le altre finestre di Anonimizza DICOM e riprova."), "Chiudi le altre finestre di Anonimizza DICOM e riprova.", 0),
+    ):
+        def boom(version, error=error):
+            raise error
+
+        relaunched, destroyed, opened = [], [], []
+        messages.clear()
+        real_destroy = window.destroy
+        window.destroy = lambda: destroyed.append(1)
+        with mock.patch.object(gui.updater, "target", lambda: Path("/x/App.exe")), \
+                mock.patch.object(gui.updater, "can_replace", lambda p: None), \
+                mock.patch.object(gui.updater, "install", boom), \
+                mock.patch.object(gui.updater, "relaunch", lambda p: relaunched.append(p)), \
+                mock.patch.object(gui.webbrowser, "open", lambda url: opened.append(url)):
+            _ask_log(gui, True)
+            window._offer_update("1.2.0")
+            _pump(window)
+            window.update()
+        assert messages == ["Errore: " + shown], messages
+        assert not relaunched and not destroyed and not window.busy
+        assert len(opened) == pages, opened
+        window.destroy = real_destroy
+    _close(window)
+
+
+def test_app_startup_update_check(tmp: Path):
+    import threading
+    import time
+
+    import app as gui
+
+    offered, calls = [], []
+
+    def latest():
+        calls.append(threading.current_thread() is not threading.main_thread())
+        return "9.9.9"
+
+    real_offer = gui.App._offer_update
+    gui.App._offer_update = lambda self, v: offered.append((v, self.busy))
+    try:
+        with mock.patch.object(gui.updater, "enabled", lambda: True), \
+                mock.patch.object(gui.updater, "VERSION", "1.0.0"), \
+                mock.patch.object(gui.updater, "latest_version", latest), \
+                mock.patch.object(gui.updater, "cleanup_old", lambda: None):
+            window, _ = _new_window()
+            if not window:
+                return
+            end = time.time() + 5
+            while not offered and time.time() < end:
+                window.update()
+                time.sleep(0.02)
+            assert offered == [("9.9.9", False)] and calls == [True], (offered, calls)  # in un thread, senza occupare l'app
+            assert window.title().endswith(" 1.0.0"), window.title()
+            _close(window)
+        # versione uguale o non attivo: nessuna domanda
+        offered.clear()
+        calls.clear()
+        for enabled, version in ((True, "1.0.0"), (False, "9.9.9")):
+            with mock.patch.object(gui.updater, "enabled", lambda e=enabled: e), \
+                    mock.patch.object(gui.updater, "VERSION", "1.0.0"), \
+                    mock.patch.object(gui.updater, "cleanup_old", lambda: None), \
+                    mock.patch.object(gui.updater, "latest_version", lambda v=version: calls.append(1) or v):
+                window, _ = _new_window()
+                time.sleep(0.3)
+                window.update()
+                _close(window)
+        assert offered == [] and calls == [1], (offered, calls)  # il secondo caso non ha nemmeno controllato
+    finally:
+        gui.App._offer_update = real_offer
+
+
+def test_app_title_shows_version():
+    import app as gui
+
+    with mock.patch.object(gui.updater, "VERSION", "dev"):
+        window, _ = _new_window()
+        if not window:
+            return
+        assert window.title() == "Anonimizza e Masterizza DICOM"
+        _close(window)
+    with mock.patch.object(gui.updater, "VERSION", "1.2.0"):
+        window, _ = _new_window()
+        assert window.title() == "Anonimizza e Masterizza DICOM 1.2.0"
+        _close(window)
+
+
+def test_aggiorna_cli(tmp: Path):
+    import contextlib
+
+    import app as gui
+
+    log = []
+
+    def run(enabled=True, latest="1.2.0", current="1.0.0", reason=None, error=None):
+        def install(v):
+            log.append(("install", v))
+            if error:
+                raise error
+            return Path("/x/App.exe")
+
+        out = io.StringIO()
+        with mock.patch.object(gui.updater, "enabled", lambda: enabled), \
+                mock.patch.object(gui.updater, "VERSION", current), \
+                mock.patch.object(gui.updater, "latest_version", lambda: latest), \
+                mock.patch.object(gui.updater, "target", lambda: Path("/x/App.exe")), \
+                mock.patch.object(gui.updater, "can_replace", lambda p: reason), \
+                mock.patch.object(gui.updater, "install", install), \
+                mock.patch.object(gui.updater, "relaunch", lambda p: log.append("relaunch")), \
+                contextlib.redirect_stdout(out):
+            code = gui.aggiorna_cli()
+        lines = out.getvalue().strip().splitlines()
+        assert len(lines) == 1 and "/x/" not in lines[0], lines  # una riga, senza percorsi
+        return code
+
+    assert run() == 0 and log == [("install", "1.2.0")]  # niente riavvio
+    log.clear()
+    assert run(latest="1.0.0") == 2 and not log
+    assert run(latest="0.9.0") == 2 and not log
+    assert run(latest=None) == 1 and not log  # niente rete
+    assert run(enabled=False) == 1 and not log  # non compilata o dev
+    assert run(reason="Cartella non scrivibile.") == 1 and not log
+    assert run(error=RuntimeError("impronta non corrispondente")) == 1 and log == [("install", "1.2.0")]
+    # collegamento nel __main__: un'app in versione dev non si aggiorna e non apre finestre
+    done = subprocess.run([sys.executable, str(Path(__file__).with_name("app.py")), "--aggiorna"], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 1 and done.stdout.startswith("AGGIORNA"), (done.returncode, done.stdout, done.stderr)
 
 
 if __name__ == "__main__":

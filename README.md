@@ -27,6 +27,22 @@ Se compare «File illeggibili» il CD è rovinato: l'esame potrebbe essere incom
 - Su PC ospedalieri l'antivirus o le policy IT possono bloccare l'app o la masterizzazione.
 - Controllo dell'installazione: `"Anonimizza DICOM" --selftest <cartella con un esame>` (Mac: dentro `Contents/MacOS/`); stampa SELFTEST e termina con 0 se è tutto a posto.
 
+## Aggiornamenti
+- All'avvio l'app controlla in background se su GitHub c'è una versione più recente. Se sì, e se non stai lavorando su un esame, chiede «Aggiornare ora?»: con Sì scarica la nuova versione (circa 20 secondi), controlla l'impronta SHA-256, sostituisce l'app, si chiude e si riapre. Con No non cambia nulla. Se non c'è rete il controllo salta in silenzio.
+- Rete: servono `github.com`, `objects.githubusercontent.com` e `release-assets.githubusercontent.com` (HTTPS). Un proxy deve essere statico e senza autenticazione (l'IT può impostare la variabile `HTTPS_PROXY`); altrimenti l'aggiornamento non parte e si scarica a mano dalla pagina della release.
+- Se la copia non può aggiornarsi da sola (cartella non scrivibile, es. `C:\Program Files`, o bundle di un altro amministratore) l'app lo dice e offre di aprire la pagina di download.
+- Mac: se l'app è ancora in Download (macOS la fa girare da una cartella temporanea) trascinala in **Applicazioni**, riaprila e riprova. Dopo ogni aggiornamento macOS può richiedere di nuovo i permessi di privacy (Volumi rimovibili).
+- L'IT può spegnere gli aggiornamenti con la variabile d'ambiente `ANONIMIZZA_NO_AGGIORNAMENTI` (qualsiasi valore) oppure con un file vuoto `no-aggiornamenti` accanto all'`.exe` (Mac: accanto all'app, nella stessa cartella).
+- L'IT può aggiornare senza finestre con `--aggiorna` (Mac: `"Anonimizza DICOM.app/Contents/MacOS/Anonimizza DICOM" --aggiorna`), solo con l'app chiusa. Termina con 0 = aggiornata (senza riavvio), 2 = già all'ultima versione, 1 = errore. Su Windows l'app non ha console: usare `start /wait "" "Anonimizza DICOM.exe" --aggiorna` e leggere `%ERRORLEVEL%`, oppure `(Start-Process -Wait -PassThru "Anonimizza DICOM.exe" --aggiorna).ExitCode`.
+- Funziona solo nell'app compilata da una release; dal sorgente la versione è `dev` e non si aggiorna mai.
+
+## Pubblicare una nuova versione
+    git tag v1.2.0 && git push origin v1.2.0
+
+Il workflow esegue test e compilazione su Windows e Mac e crea la release con `Anonimizza-DICOM-Windows.exe`, `Anonimizza-DICOM-Mac.zip` e `SHA256SUMS.txt`. Il tag deve essere `vX.Y.Z` (niente `-rc` o simili), crescere a ogni versione e non riusare mai un numero già pubblicato: l'app propone l'aggiornamento solo se è maggiore di quella installata. I push senza tag producono solo gli artifact. Per provare l'aggiornamento su Windows (servono almeno due release) lancia a mano il workflow `prova-aggiornamento`.
+
+Sicurezza degli aggiornamenti: le app installate si fidano del repository `quiquo7qua/anonimizza-dicom`, quindi non rinominare né cancellare mai l'account o il repository (chi ne prendesse il nome potrebbe distribuire aggiornamenti: «repo-jacking»). Tieni attiva la 2FA, proteggi i tag `v*` con un ruleset (niente cancellazione o spostamento) e abilita le release immutabili.
+
 ## Sviluppo
     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pyinstaller==6.11.1
     .venv/bin/python test_anon.py

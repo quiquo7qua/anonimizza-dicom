@@ -1,0 +1,38 @@
+name: prova-aggiornamento
+# Prova su Windows: l'.exe della release precedente (deve già contenere --aggiorna) si aggiorna all'ultima release.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  prova:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tags = @(gh release list --exclude-drafts --exclude-pre-releases --limit 2 --json tagName --jq '.[].tagName')  # dalla più recente
+          if ($tags.Count -lt 2) { throw "servono almeno due release" }
+          $new, $old = $tags
+          $dir = Join-Path $env:RUNNER_TEMP "prova"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          gh release download $old --pattern "Anonimizza-DICOM-Windows.exe" --dir $dir
+          $exe = Join-Path $dir "Anonimizza-DICOM-Windows.exe"
+          # app senza console: Start-Process -Wait per avere il codice di uscita
+          $p = Start-Process -FilePath $exe -ArgumentList "--aggiorna" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "--aggiorna da $old a $new: codice $($p.ExitCode)" }
+          gh release download $new --pattern "SHA256SUMS.txt" --dir $dir
+          $line = Get-Content (Join-Path $dir "SHA256SUMS.txt") | Where-Object { $_ -match "Anonimizza-DICOM-Windows\.exe$" }
+          $expected = ($line -split "\s+")[0].ToLower()
+          $actual = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "impronta diversa dopo l'aggiornamento: $actual invece di $expected" }
+          # --aggiorna non cancella il vecchio: lo toglie l'app al prossimo avvio
+          if (-not (Test-Path "$exe.old")) { throw "manca il file .old: la sostituzione non è passata dalla rinomina" }
+          # il nuovo .exe parte, ha la nuova versione e non propone altri aggiornamenti: 2 = già all'ultima
+          $p = Start-Process -FilePath $exe -ArgumentList "--aggiorna" -Wait -PassThru
+          if ($p.ExitCode -ne 2) { throw "secondo --aggiorna: atteso 2, ottenuto $($p.ExitCode)" }
+          Write-Host "ok: $old -> $new"

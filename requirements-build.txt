@@ -1,0 +1,11 @@
+# Versioni esatte per la compilazione in CI (senza hash: uv non era disponibile). Aggiornare a mano insieme a requirements.txt.
+pydicom==3.0.2
+pywin32==308; sys_platform == "win32"
+pyinstaller==6.11.1
+pyinstaller-hooks-contrib==2026.10
+altgraph==0.17.5
+packaging==26.3
+setuptools==84.2.1
+macholib==1.16.4; sys_platform == "darwin"
+pefile==2023.2.7; sys_platform == "win32"
+pywin32-ctypes==0.2.3; sys_platform == "win32"

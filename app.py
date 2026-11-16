@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from itertools import groupby
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -16,6 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 import anonymizer as an
 import burner
 import scanner
+import updater
 
 CD_BYTES = 700 * 1024 * 1024
 DVD_BYTES = 4_700_000_000
@@ -67,7 +69,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         sweep_temp()
-        self.title("Anonimizza e Masterizza DICOM")
+        updater.cleanup_old()  # Windows: l'.exe precedente rimasto dopo un aggiornamento
+        self.title("Anonimizza e Masterizza DICOM" + ("" if updater.VERSION == "dev" else f" {updater.VERSION}"))
         self.geometry("820x660")
         self.minsize(700, 560)
         self.series: list[scanner.Series] = []
@@ -78,6 +81,7 @@ class App(tk.Tk):
         self.partial: Path | None = None  # cartella di salvataggio in scrittura (creata dall'app)
         self.report: an.Report | None = None
         self.busy = False
+        self.dialog_open = False  # scelta cartella aperta: niente domande sopra
         self.burning = False
         self.closing = False  # dialogo di uscita aperto: il flusso resta fermo
         self.worker: threading.Thread | None = None
@@ -89,6 +93,8 @@ class App(tk.Tk):
         if self.tk.call("tk", "windowingsystem") == "aqua":  # Cmd+Q, Dock > Esci, logout
             self.createcommand("::tk::mac::Quit", self.on_close)
         self._poll_id = self.after(100, self._poll)
+        if updater.enabled():
+            threading.Thread(target=self._check_update, daemon=True).start()
 
     def report_callback_exception(self, exc, val, tb):
         """Negli eseguibili senza console gli errori dei pulsanti sarebbero invisibili."""
@@ -221,9 +227,10 @@ class App(tk.Tk):
                 kind, *args = self.events.get_nowait()
                 if kind == "progress":
                     self._show_progress(*args)
-                else:
+                else:  # "done": fine di un lavoro; "call": avviso dal thread, non tocca lo stato di lavoro
                     callback, value = args
-                    self._set_busy(False)
+                    if kind == "done":
+                        self._set_busy(False)
                     try:
                         callback(value)
                     except Exception as exc:  # un errore qui non deve fermare il ciclo
@@ -232,6 +239,57 @@ class App(tk.Tk):
             pass
         finally:
             self._poll_id = self.after(100, self._poll)
+
+    # ---------- aggiornamenti ----------
+
+    def _check_update(self):  # thread di sfondo: ogni errore è già un None
+        version = updater.latest_version()
+        if version and updater.is_newer(version, updater.VERSION):
+            self.events.put(("call", self._offer_update, version))
+
+    def _ask_folder(self, **options) -> str:
+        self.dialog_open = True
+        try:
+            return filedialog.askdirectory(**options)
+        finally:
+            self.dialog_open = False
+
+    def _offer_update(self, version: str):
+        if self.busy or self.series or self.dialog_open:  # niente domande a metà lavoro: per questa sessione si salta
+            return
+        try:
+            reason = updater.can_replace(updater.target())
+        except updater.UpdateError as exc:
+            reason = str(exc).rstrip(".").lower()
+        if reason:  # inutile promettere un aggiornamento che non può riuscire
+            if messagebox.askyesno(
+                "Aggiornamento",
+                f"È disponibile la versione {version}, ma questa copia non può aggiornarsi da sola ({reason}). "
+                "Aprire la pagina di download?",
+            ):
+                webbrowser.open(updater.RELEASE_PAGE)
+            return
+        if not messagebox.askyesno(
+            "Aggiornamento",
+            f"È disponibile la versione {version} (attuale {updater.VERSION}). Aggiornare ora? "
+            "Ci vogliono circa 20 secondi. L'app si chiuderà e si riaprirà.",
+        ):
+            return
+
+        def work(progress):
+            progress(0, 0, "Aggiornamento in corso")
+            return updater.install(version)
+
+        def failed(exc):
+            self.show_error(updater.UpdateError(updater.explain(exc)))
+            if not isinstance(exc, updater.UpdateError) and updater.explain(exc) == updater.FAILED:
+                webbrowser.open(updater.RELEASE_PAGE)  # il motivo è ignoto: si scarica a mano
+
+        def done(path):
+            updater.relaunch(path)
+            self.after(0, self.on_close)  # fuori da _poll, che sta ancora girando
+
+        self.run_bg(work, done, failed)
 
     def show_error(self, exc: Exception):
         self.cleanup()
@@ -283,7 +341,7 @@ class App(tk.Tk):
             return
         root = sources[0]
         if len(sources) > 1:  # più dischi con esami: l'utente sceglie
-            chosen = filedialog.askdirectory(
+            chosen = self._ask_folder(
                 title="Ho trovato più dischi con esami: scegli la cartella giusta", initialdir=str(root)
             )
             if not chosen:
@@ -292,7 +350,7 @@ class App(tk.Tk):
         self.load(root, cd=True)
 
     def on_choose_folder(self):
-        folder = filedialog.askdirectory(title="Cartella con l'esame DICOM")
+        folder = self._ask_folder(title="Cartella con l'esame DICOM")
         if folder:
             self.load(Path(folder), cd=False)
 
@@ -476,7 +534,7 @@ class App(tk.Tk):
         chosen = self._ready()
         if not chosen:
             return
-        folder = filedialog.askdirectory(title="Dove salvo l'esame anonimo?")
+        folder = self._ask_folder(title="Dove salvo l'esame anonimo?")
         if not folder:
             return
         name, keep = self.name.get().strip(), self.keep.get()
@@ -603,7 +661,7 @@ class App(tk.Tk):
             "Salvare l'esame anonimo?",
             lead + "Vuoi salvare l'esame anonimo in una cartella, per masterizzarlo o copiarlo più tardi?",
         ):
-            folder = filedialog.askdirectory(title="Dove salvo l'esame anonimo?")
+            folder = self._ask_folder(title="Dove salvo l'esame anonimo?")
             if not folder:
                 continue
             dest, n = Path(folder) / out.name, 2
@@ -654,6 +712,13 @@ def selftest(folder) -> int:
         except Exception as exc:
             print(f"SELFTEST: pywin32 non incluso ({type(exc).__name__})")
             return 1
+    if sys.platform == "darwin":  # l'app compilata non ha un suo pacchetto di CA: senza, gli aggiornamenti non funzionerebbero mai
+        try:
+            if updater.context().cert_store_stats()["x509_ca"] == 0:
+                raise OSError("nessuna CA")
+        except Exception as exc:
+            print(f"SELFTEST: certificati di sistema non disponibili ({type(exc).__name__})")
+            return 1
     series = [s for s in scanner.scan(Path(folder))[0] if s.risk is None]
     if not series:
         print("SELFTEST: nessuna serie")
@@ -672,7 +737,34 @@ def selftest(folder) -> int:
     return 0 if report.written > 0 and not leaks and fileset_ok else 1
 
 
+def aggiorna_cli() -> int:
+    """Controllo e installazione senza finestre e senza riavvio. 0 = aggiornata, 2 = già all'ultima, 1 = errore."""
+    if not updater.enabled():
+        print("AGGIORNA: non disponibile (versione di sviluppo o aggiornamenti disattivati)")
+        return 1
+    version = updater.latest_version()
+    if not version:
+        print("AGGIORNA: impossibile controllare gli aggiornamenti (rete?)")
+        return 1
+    if not updater.is_newer(version, updater.VERSION):
+        print(f"AGGIORNA: già all'ultima versione ({updater.VERSION})")
+        return 2
+    try:
+        reason = updater.can_replace(updater.target())
+        if reason:
+            print(f"AGGIORNA: {reason[0].upper()}{reason[1:]}.")
+            return 1
+        updater.install(version)
+    except Exception as exc:
+        print(f"AGGIORNA: {updater.explain(exc)}")
+        return 1
+    print(f"AGGIORNA: aggiornata alla versione {version}")
+    return 0
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--selftest"] and len(sys.argv) > 2:
         sys.exit(selftest(sys.argv[2]))
+    if sys.argv[1:2] == ["--aggiorna"]:
+        sys.exit(aggiorna_cli())
     App().mainloop()
