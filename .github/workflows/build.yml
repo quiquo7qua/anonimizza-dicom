@@ -1,0 +1,38 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller==6.11.1
+      - run: python test_anon.py
+      - run: python -c "from pathlib import Path; import test_anon as t; t.make_source(Path('esempio'))"
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --disable-windowed-traceback --name "Anonimizza DICOM" app.py
+          # app senza console: Start-Process -Wait per avere il codice di uscita
+          $p = Start-Process -FilePath "dist/Anonimizza DICOM.exe" -ArgumentList "--selftest","esempio" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "autoverifica fallita: $($p.ExitCode)" }
+      - if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --windowed --osx-bundle-identifier local.anonimizza-dicom --name "Anonimizza DICOM" app.py
+          plutil -replace CFBundleDevelopmentRegion -string it "dist/Anonimizza DICOM.app/Contents/Info.plist"
+          plutil -replace CFBundleLocalizations -json '["it"]' "dist/Anonimizza DICOM.app/Contents/Info.plist"
+          codesign --force --deep -s - "dist/Anonimizza DICOM.app"
+          "dist/Anonimizza DICOM.app/Contents/MacOS/Anonimizza DICOM" --selftest esempio
+          cd dist && ditto -c -k --keepParent "Anonimizza DICOM.app" "Anonimizza DICOM-mac.zip" && rm -rf "Anonimizza DICOM.app" "Anonimizza DICOM"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anonimizza-dicom-${{ runner.os }}
+          path: dist/
